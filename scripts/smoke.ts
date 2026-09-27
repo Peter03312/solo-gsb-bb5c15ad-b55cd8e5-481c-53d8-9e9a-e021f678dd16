@@ -19,11 +19,21 @@ import { buildOption121, encodeRoute, resolveClientSegment } from '../src/lib/op
 import { buildDhcpPool, resolvePoolSegment } from '../src/lib/dhcpPool'
 import { buildLeaseImport, mapHeader, parseCsv } from '../src/lib/leaseImport'
 import { checkMac, normalizeMacInput } from '../src/lib/mac'
+import {
+  fragmentPiece,
+  IPV4_HEADER_LEN,
+  listValidDevices,
+  originalDatagram,
+  parseMtu,
+  parsePayload,
+  simulateFragments,
+  validateFragInput,
+} from '../src/lib/fragmentation'
 import { buildExportJson } from '../src/lib/exporter'
 import { intToIp, ipToInt, prefixForHosts } from '../src/lib/ip'
 import { plan } from '../src/lib/planner'
 import { blocksToCidrList, summarizeSegments } from '../src/lib/summary'
-import type { DhcpExclusionInput, HostAssignment, PlannerInput, Segment } from '../src/lib/types'
+import type { DhcpExclusionInput, FragHopInput, HostAssignment, PlannerInput, Segment } from '../src/lib/types'
 
 let failures = 0
 function check(name: string, cond: boolean, extra = '') {
@@ -2637,6 +2647,206 @@ function simulateNoTransientDup(
   })())
   const fixedCsv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.20/30,管理A,192.168.10.22,aa:bb:cc:00:00:01'].join('\n')
   check('改到新网段后恢复编排', buildMigrationPlan(importOrThrow(fixedCsv, existing, migratedPlan), existing, migratedPlan).steps.length === 1)
+}
+
+// ========== 24) IPv4 路径分片预演 ==========
+const fragHops = (mtus: Array<number | string>): FragHopInput[] =>
+  mtus.map((m, i) => ({ id: `fh${i}`, mtu: String(m) }))
+
+/** 提取最终分片的 [start,len,offset,mf] 便于断言 */
+function sig(pieces: { payloadStart: number; payloadLen: number; offset: number; mf: boolean }[]) {
+  return JSON.stringify(pieces.map((p) => [p.payloadStart, p.payloadLen, p.offset, p.mf ? 1 : 0]))
+}
+
+// 24a) 不超过 MTU：原样通过，单一片 MF=0
+{
+  const s = simulateFragments({ payloadLen: 1400, df: false, mtus: [1500] })
+  check('1400 负载经 MTU1500 不碎片', s.pieceCount === 1 && !s.blocked)
+  check('原始总长度=1420、首部开销=20、合计 1420', s.finalPieces[0].totalLen === 1420 && s.headerOverhead === 20 && s.totalBytes === 1420)
+  check('单片 offset=0、MF=0', s.finalPieces[0].offset === 0 && s.finalPieces[0].mf === false)
+}
+
+// 24b) 经典拆分：3000 负载经 MTU1500 -> 1480/1480/40，偏移 0/185/370，MF 1/1/0
+{
+  const s = simulateFragments({ payloadLen: 3000, df: false, mtus: [1500] })
+  check('3000 负载经 MTU1500 拆成 3 片', s.pieceCount === 3, sig(s.finalPieces))
+  check(
+    '三片范围/偏移/MF 正确（1480,1480,40；0,185,370；1,1,0）',
+    sig(s.finalPieces) === JSON.stringify([[0, 1480, 0, 1], [1480, 1480, 185, 1], [2960, 40, 370, 0]]),
+    sig(s.finalPieces),
+  )
+  check('非末片负载为 8 的倍数（1480%8=0）', 1480 % 8 === 0)
+  check('首部开销 3×20=60，总字节 3000+60=3060', s.headerOverhead === 60 && s.totalBytes === 3060)
+  check('负载守恒：三片负载合计=3000', s.finalPieces.reduce((n, p) => n + p.payloadLen, 0) === 3000)
+}
+
+// 24c) 多跳：1500 分片后再经 1400 跳只拆超片、不重组；再经 1500 原样保持
+{
+  const s = simulateFragments({ payloadLen: 3000, df: false, mtus: [1500, 1400, 1500] })
+  check('未阻断、共 3 跳', !s.blocked && s.hops.length === 3)
+  check('第 1 跳 1→3 片', s.hops[0].inCount === 1 && s.hops[0].outCount === 3)
+  check('第 2 跳 3→5 片（两片 1480 各拆 1376+104，40 片通过）', s.hops[1].inCount === 3 && s.hops[1].outCount === 5)
+  check(
+    '第 2 跳结果：1376/104/1376/104/40，偏移 0,172,185,357,370，仅末片 MF=0',
+    sig(s.finalPieces) ===
+      JSON.stringify([
+        [0, 1376, 0, 1],
+        [1376, 104, 172, 1],
+        [1480, 1376, 185, 1],
+        [2856, 104, 357, 1],
+        [2960, 40, 370, 0],
+      ]),
+    sig(s.finalPieces),
+  )
+  check('第 3 跳（1500）全部原样通过：片数不增不减', s.hops[2].pieces.every((p) => p.passed) && s.hops[2].outCount === 5)
+  check('偏移始终相对原始负载（无重组、不重新归零）', s.finalPieces.every((p) => p.offset * 8 === p.payloadStart))
+}
+
+// 24d) 最小 MTU 68：负载上限 48，且 48 是 8 的倍数
+{
+  const s = simulateFragments({ payloadLen: 100, df: false, mtus: [68] })
+  check('100 负载经 MTU68 -> 48/48/4 三片（偏移 0/6/12）',
+    s.pieceCount === 3 &&
+      sig(s.finalPieces) === JSON.stringify([[0, 48, 0, 1], [48, 48, 6, 1], [96, 4, 12, 0]]),
+    sig(s.finalPieces),
+  )
+  check('每片总长度不超过 68', s.finalPieces.every((p) => p.totalLen <= 68))
+}
+
+// 24e) DF=1 通过路径（所有跳 MTU 足够）
+{
+  const s = simulateFragments({ payloadLen: 1400, df: true, mtus: [1500, 1500] })
+  check('DF=1 且始终不超 MTU：不阻断、单一片', !s.blocked && s.pieceCount === 1)
+}
+
+// 24f) DF=1 在首个阻断跳停止：第 1 跳 1500 通过，第 2 跳 1400（总长度 1420）阻断
+{
+  const s = simulateFragments({ payloadLen: 1400, df: true, mtus: [1500, 1400] })
+  check('DF=1 在第 2 跳阻断', s.blocked && s.blockedHopIndex === 2)
+  check('阻断后不再执行后续跳（hops 止于第 2 跳）', s.hops.length === 2)
+  check('阻断信息指出超 MTU 的原始片（offset=0、总长度 1420）', s.hops[1].blocked?.piece.totalLen === 1420)
+}
+
+// 24g) DF=1 在第 1 跳即阻断
+{
+  const s = simulateFragments({ payloadLen: 3000, df: true, mtus: [1500] })
+  check('DF=1 第 1 跳超 MTU 即阻断', s.blocked && s.blockedHopIndex === 1 && s.pieceCount === 1)
+}
+
+// 24h) 原始末片负载不必是 8 的倍数（41），且后续跳再分片时它作为「覆盖原始末尾」的片保留 41
+{
+  const s = simulateFragments({ payloadLen: 3001, df: false, mtus: [1500] })
+  check('3001 -> 1480/1480/41，末片 41 非 8 倍数且 MF=0',
+    sig(s.finalPieces) === JSON.stringify([[0, 1480, 0, 1], [1480, 1480, 185, 1], [2960, 41, 370, 0]]),
+    sig(s.finalPieces))
+  // 经 MTU300（负载上限 280）：前两片各拆 5×280+80（6 片），41 片原样通过
+  const s2 = simulateFragments({ payloadLen: 3001, df: false, mtus: [1500, 300] })
+  check('二次分片共 13 片，原始末片 41 字节保留、offset=370、MF=0',
+    s2.pieceCount === 13 &&
+      s2.finalPieces[12].payloadStart === 2960 &&
+      s2.finalPieces[12].payloadLen === 41 &&
+      s2.finalPieces[12].offset === 370 &&
+      s2.finalPieces[12].mf === false,
+    sig(s2.finalPieces))
+  check('二次分片的中间片负载全部 8 字节对齐', s2.finalPieces.slice(0, 12).every((p) => p.payloadLen % 8 === 0))
+  check('二次分片每片总长度 <= 300', s2.finalPieces.every((p) => p.totalLen <= 300))
+}
+
+// 24i) 总长度恰好等于 MTU 视为通过（不超过即原样）
+{
+  const s = simulateFragments({ payloadLen: 1480, df: false, mtus: [1500, 1500] })
+  check('1480 负载（总长度 1500）恰好等于 MTU：两跳均原样通过',
+    s.pieceCount === 1 && s.hops.every((h) => h.pieces.every((p) => p.passed)))
+}
+
+// 24j) 原始报文与片偏移工具
+{
+  const d = originalDatagram(65515)
+  check('最大负载 65515 的原始总长度=65535', d[0].totalLen === 65535 && d[0].payloadLen === 65515 && d[0].mf === false)
+  check('固定首部常量为 20', IPV4_HEADER_LEN === 20)
+  const kids = fragmentPiece({ payloadStart: 0, payloadEnd: 100, payloadLen: 100, totalLen: 120, offset: 0, mf: false }, 68, 100)
+  check('fragmentPiece 手工拆分 100@MTU68 -> 48/48/4',
+    sig(kids) === JSON.stringify([[0, 48, 0, 1], [48, 48, 6, 1], [96, 4, 12, 0]]), sig(kids))
+}
+
+// 24k) parsePayload 边界
+check('负载 0 非法（低于 1）', 'error' in parsePayload('0'))
+check('负载 1 合法', !('error' in parsePayload('1')))
+check('负载 65515 合法', !('error' in parsePayload('65515')))
+check('负载 65516 非法（超总长度上限）', 'error' in parsePayload('65516'))
+check('负载空串非法', 'error' in parsePayload('   '))
+check('负载非整数非法', 'error' in parsePayload('1400.5'))
+// 24l) parseMtu 边界
+check('MTU 67 非法（低于最小 68）', 'error' in parseMtu('67'))
+check('MTU 68 合法', !('error' in parseMtu('68')))
+check('MTU 65535 合法', !('error' in parseMtu('65535')))
+check('MTU 65536 非法', 'error' in parseMtu('65536'))
+check('MTU 空串非法', 'error' in parseMtu(''))
+check('MTU 非整数非法', 'error' in parseMtu('1.5k'))
+
+// 24m) validateFragInput：逐字段 / 逐跳定位错误
+{
+  const devices = listValidDevices(
+    [{ id: 'h1', ownerId: 'q4', name: '设备A', address: ipToInt('192.168.10.17'), mode: 'auto' }],
+    hostPlan,
+  )
+  check('有效登记出现在设备清单（设备A 192.168.10.17）', devices.length === 1 && devices[0].id === 'h1' && devices[0].ip === '192.168.10.17')
+
+  const v = validateFragInput({ deviceId: 'h1', devices, payloadRaw: '3000', hops: fragHops([1500, 'abc']) })
+  check('第 2 跳 MTU 非法被定位（hopIndex=2）', v.errors.length === 1 && v.errors[0].field === 'mtu' && v.errors[0].hopIndex === 2)
+  check('存在 MTU 错误时不返回 mtus（暂停预演）', v.mtus === undefined && v.payloadLen === 3000)
+
+  const v2 = validateFragInput({ deviceId: '', devices, payloadRaw: '0', hops: fragHops([]) })
+  check('设备 / 负载 / 跳数三类错误同时定位',
+    v2.errors.some((e) => e.field === 'device') &&
+    v2.errors.some((e) => e.field === 'payload') &&
+    v2.errors.some((e) => e.field === 'mtu' && e.hopIndex === undefined),
+    JSON.stringify(v2.errors))
+
+  const v3 = validateFragInput({ deviceId: 'h1', devices, payloadRaw: '1400', hops: fragHops([1, 2, 3, 4, 5, 6, 7, 8, 9]) })
+  check('超过 8 跳报错', v3.errors.some((e) => /最多 8 跳/.test(e.message)))
+
+  const ok = validateFragInput({ deviceId: 'h1', devices, payloadRaw: '1400', hops: fragHops([1500, 1400]) })
+  check('全部合法时零错误且解析出 mtus', ok.errors.length === 0 && JSON.stringify(ok.mtus) === '[1500,1400]')
+}
+
+// 24n) 设备清单实时反映登记有效性：越界登记不列出；规划输入非法时清单为空
+{
+  const mixed = listValidDevices(
+    [
+      { id: 'ok', ownerId: 'q4', name: '有效', address: ipToInt('192.168.10.17'), mode: 'auto' },
+      { id: 'bad', ownerId: 'q4', name: '越界', address: ipToInt('192.168.10.40'), mode: 'manual' },
+    ],
+    hostPlan,
+  )
+  check('失效登记不出现在发送设备清单', mixed.length === 1 && mixed[0].id === 'ok')
+  const broken = plan({
+    parentCidr: '192.168.2.0/24',
+    reservations: [],
+    requirements: [{ id: 'x', name: 'X', hosts: 100, cidr: '192.168.9.0/24' }],
+  })
+  check('规划输入非法时设备清单为空（面板暂停）', broken.inputErrors.length > 0 && listValidDevices([], broken).length === 0)
+}
+
+// 24o) 全跳守恒：任何一跳输出片负载并集都等于原始负载，且偏移 8 字节对齐、覆盖不重不漏
+{
+  const s = simulateFragments({ payloadLen: 5000, df: false, mtus: [1500, 1200, 800, 1500, 68] })
+  check('五级 MTU 路径未阻断', !s.blocked)
+  for (const h of s.hops) {
+    // 每跳输出片（拆分则展开子片，否则来源片本身）
+    const out = h.pieces.flatMap((p) => p.splitInto ?? [p.piece])
+    const sum = out.reduce((n, p) => n + p.payloadLen, 0)
+    const aligned = out.every((p) => p.payloadStart % 8 === 0 && p.offset * 8 === p.payloadStart)
+    const ordered = out.every((p, i) => i === 0 || p.payloadStart === out[i - 1].payloadEnd)
+    const mfOnlyLast = out.filter((p) => !p.mf).length === 1 && out[out.length - 1].mf === false
+    check(
+      `第 ${h.hopIndex} 跳守恒（负载合计 5000、偏移对齐、首尾相接、仅末片 MF=0）`,
+      sum === 5000 && aligned && ordered && mfOnlyLast && out[0].payloadStart === 0 && out[out.length - 1].payloadEnd === 5000,
+      JSON.stringify({ sum, aligned, ordered, mfOnlyLast }),
+    )
+  }
+  check('末跳 MTU68：所有片总长度 ≤ 68 且片数 >1', s.finalPieces.every((p) => p.totalLen <= 68) && s.pieceCount > 1)
+  check('后续更大 MTU 不会重组（片数单调不减）', s.hops.every((h, i) => i === 0 || h.outCount >= s.hops[i - 1].outCount))
 }
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)

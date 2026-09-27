@@ -1723,3 +1723,241 @@ tr.rdns-skip-row td {
   line-height: 1.55;
   min-width: 280px;
 }
+
+/* ========== ⑫ IPv4 路径分片预演 ========== */
+
+.frag-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 0.8fr) minmax(0, 1fr);
+  gap: 12px;
+  align-items: start;
+  margin-bottom: 14px;
+}
+
+@media (max-width: 900px) {
+  .frag-form {
+    grid-template-columns: 1fr;
+  }
+}
+
+.frag-field-error {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--danger);
+}
+
+.frag-field-hint {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.frag-input-bad {
+  border-color: rgba(248, 113, 113, 0.65) !important;
+  background: rgba(248, 113, 113, 0.08) !important;
+}
+
+.frag-device-meta {
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.frag-df-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 13px;
+  cursor: pointer;
+  min-height: 36px;
+}
+
+.frag-df-check.is-on {
+  border-color: rgba(245, 158, 11, 0.6);
+  background: rgba(245, 158, 11, 0.08);
+}
+
+.frag-df-check input {
+  width: auto;
+  margin: 0;
+}
+
+.frag-hops-head {
+  margin-bottom: 8px;
+}
+
+.frag-hop-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.frag-hop {
+  display: grid;
+  grid-template-columns: 64px 150px minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 10px;
+}
+
+.frag-hop.has-error {
+  border-color: rgba(248, 113, 113, 0.55);
+  background: rgba(248, 113, 113, 0.06);
+  grid-template-columns: 64px 150px minmax(0, 1fr) auto;
+}
+
+.frag-hop.has-error .frag-field-error {
+  grid-column: 2 / 5;
+}
+
+.frag-hop-idx {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.frag-hop-unit {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.frag-hop-arrows {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.frag-hop-arrows .icon {
+  padding: 2px 7px;
+}
+
+.frag-result {
+  margin-top: 14px;
+}
+
+.frag-blocked-box {
+  background: rgba(248, 113, 113, 0.1);
+  border: 1px solid rgba(248, 113, 113, 0.5);
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 10px 0;
+  font-size: 13px;
+  color: #fca5a5;
+}
+
+.frag-blocked-box div {
+  margin-top: 4px;
+}
+
+.frag-hop-outcome {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 10px 0;
+  background: rgba(36, 51, 73, 0.45);
+}
+
+.frag-hop-outcome.is-blocked {
+  border-color: rgba(248, 113, 113, 0.55);
+  background: rgba(248, 113, 113, 0.05);
+}
+
+.frag-hop-outcome-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.frag-hop-outcome-head h3 {
+  margin: 0;
+  font-size: 13px;
+}
+
+.frag-hop-stat {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.frag-badge {
+  display: inline-block;
+  font-size: 11px;
+  border-radius: 4px;
+  padding: 1px 7px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+.frag-badge-pass {
+  color: #6ee7b7;
+  border-color: rgba(52, 211, 153, 0.45);
+  background: rgba(52, 211, 153, 0.08);
+}
+
+.frag-badge-split {
+  color: #fcd34d;
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(245, 158, 11, 0.09);
+}
+
+.frag-badge-block {
+  color: #fca5a5;
+  border-color: rgba(248, 113, 113, 0.55);
+  background: rgba(248, 113, 113, 0.1);
+}
+
+.frag-table {
+  font-size: 12px;
+}
+
+.frag-table th,
+.frag-table td {
+  white-space: nowrap;
+}
+
+.frag-src-range {
+  color: var(--muted);
+}
+
+.frag-src-tag {
+  display: inline-block;
+  margin-left: 6px;
+  font-size: 10px;
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+}
+
+.frag-row-split td {
+  background: rgba(245, 158, 11, 0.04);
+}
+
+.frag-row-blocked td {
+  background: rgba(248, 113, 113, 0.06);
+}
+
+.frag-muted {
+  color: var(--muted);
+}
+
+.frag-mf-on {
+  color: #fcd34d;
+}
+
+.frag-summary {
+  margin-top: 12px;
+  border-top: 1px dashed var(--border);
+  padding-top: 10px;
+}
+
+.frag-summary h3 {
+  margin: 0 0 8px;
+  font-size: 13px;
+}

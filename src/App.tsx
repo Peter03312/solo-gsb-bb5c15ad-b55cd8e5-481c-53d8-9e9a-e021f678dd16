@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import AddressBar from './components/AddressBar'
 import BaselinePanel from './components/BaselinePanel'
 import DhcpPoolPanel from './components/DhcpPoolPanel'
+import FragmentPanel from './components/FragmentPanel'
 import HostAddressPanel from './components/HostAddressPanel'
 import LeaseImportPanel from './components/LeaseImportPanel'
 import MigrationPanel from './components/MigrationPanel'
@@ -26,6 +27,7 @@ import { plan } from './lib/planner'
 import type {
   Baseline,
   DhcpExclusionInput,
+  FragHopInput,
   HostAssignment,
   Option121RouteInput,
   RequirementInput,
@@ -43,6 +45,13 @@ let leaseCounter = 0
 function leaseUid(): string {
   leaseCounter += 1
   return `lease-${Date.now()}-${leaseCounter}`
+}
+
+// 路径分片预演的跳行稳定 ID（默认首跳的初始化与面板内新增共用）
+let fragHopCounter = 0
+function fragHopUid(): string {
+  fragHopCounter += 1
+  return `frag-hop-init-${Date.now()}-${fragHopCounter}`
 }
 
 const DEMO = {
@@ -77,6 +86,13 @@ export default function App() {
   const [dhcpPoolExclusions, setDhcpPoolExclusions] = useState<DhcpExclusionInput[]>([])
   // 静态租约批量导入：原始 CSV 文本始终保留在页面内存中，规划/登记变化后实时重算预览
   const [leaseImportCsv, setLeaseImportCsv] = useState('')
+  // IPv4 路径分片预演：设备选择与全部参数录入始终保留；设备失效 / 输入非法时仅暂停预演
+  const [fragDeviceId, setFragDeviceId] = useState('')
+  const [fragPayload, setFragPayload] = useState('1400')
+  const [fragDf, setFragDf] = useState(false)
+  const [fragHops, setFragHops] = useState<FragHopInput[]>(() => [
+    { id: fragHopUid(), mtu: '1500' },
+  ])
 
   // 重排生效条件：有基线、父网段为规范 CIDR 且与基线完全一致（输入非法/父网段变化时禁用）
   const parentForReflow = useMemo(() => {
@@ -167,6 +183,10 @@ export default function App() {
     setDhcpPoolOwnerId('')
     setDhcpPoolExclusions([])
     setLeaseImportCsv('')
+    setFragDeviceId('')
+    setFragPayload('1400')
+    setFragDf(false)
+    setFragHops([{ id: fragHopUid(), mtu: '1500' }])
   }
 
   const hasInput =
@@ -417,6 +437,19 @@ export default function App() {
       />
 
       <MigrationPanel result={result} assignments={hostAssignments} imported={leaseImport} />
+
+      <FragmentPanel
+        result={result}
+        assignments={hostAssignments}
+        deviceId={fragDeviceId}
+        payloadRaw={fragPayload}
+        df={fragDf}
+        hops={fragHops}
+        onDeviceChange={setFragDeviceId}
+        onPayloadChange={setFragPayload}
+        onDfChange={setFragDf}
+        onHopsChange={setFragHops}
+      />
 
       {result.segments.length > 0 && (
         <div className="panel">
