@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import AddressBar from './components/AddressBar'
 import BaselinePanel from './components/BaselinePanel'
 import DhcpPoolPanel from './components/DhcpPoolPanel'
+import FragmentPanel from './components/FragmentPanel'
 import HostAddressPanel from './components/HostAddressPanel'
 import LeaseImportPanel from './components/LeaseImportPanel'
 import MigrationPanel from './components/MigrationPanel'
@@ -26,6 +27,7 @@ import { plan } from './lib/planner'
 import type {
   Baseline,
   DhcpExclusionInput,
+  FragHopInput,
   HostAssignment,
   Option121RouteInput,
   RequirementInput,
@@ -36,6 +38,13 @@ let counter = 0
 function uid(): string {
   counter += 1
   return `id-${Date.now()}-${counter}`
+}
+
+// 分片预演 MTU 跳的稳定 ID（行内生成，删除/增改后保留其余行）
+let hopCounter = 0
+function hopUid(): string {
+  hopCounter += 1
+  return `hop-${Date.now()}-${hopCounter}`
 }
 
 // 批量导入新登记的稳定 ID（App 层统一生成，导入面板与迁移编排共享同一份预览）
@@ -77,6 +86,11 @@ export default function App() {
   const [dhcpPoolExclusions, setDhcpPoolExclusions] = useState<DhcpExclusionInput[]>([])
   // 静态租约批量导入：原始 CSV 文本始终保留在页面内存中，规划/登记变化后实时重算预览
   const [leaseImportCsv, setLeaseImportCsv] = useState('')
+  // IPv4 路径分片预演：发送设备（登记稳定 ID）+ 负载/DF/逐跳 MTU（行内稳定 ID，变化后保留并重新校验）
+  const [fragDeviceId, setFragDeviceId] = useState('')
+  const [fragPayload, setFragPayload] = useState('')
+  const [fragDf, setFragDf] = useState(false)
+  const [fragHops, setFragHops] = useState<FragHopInput[]>(() => [{ id: hopUid(), mtu: '' }])
 
   // 重排生效条件：有基线、父网段为规范 CIDR 且与基线完全一致（输入非法/父网段变化时禁用）
   const parentForReflow = useMemo(() => {
@@ -153,6 +167,10 @@ export default function App() {
     setDhcpPoolOwnerId('')
     setDhcpPoolExclusions([])
     setLeaseImportCsv('')
+    setFragDeviceId('')
+    setFragPayload('')
+    setFragDf(false)
+    setFragHops([{ id: hopUid(), mtu: '' }])
   }
 
   function clearAll() {
@@ -167,6 +185,10 @@ export default function App() {
     setDhcpPoolOwnerId('')
     setDhcpPoolExclusions([])
     setLeaseImportCsv('')
+    setFragDeviceId('')
+    setFragPayload('')
+    setFragDf(false)
+    setFragHops([{ id: hopUid(), mtu: '' }])
   }
 
   const hasInput =
@@ -417,6 +439,19 @@ export default function App() {
       />
 
       <MigrationPanel result={result} assignments={hostAssignments} imported={leaseImport} />
+
+      <FragmentPanel
+        result={result}
+        assignments={hostAssignments}
+        deviceId={fragDeviceId}
+        payload={fragPayload}
+        df={fragDf}
+        hops={fragHops}
+        onDeviceChange={setFragDeviceId}
+        onPayloadChange={setFragPayload}
+        onDfChange={setFragDf}
+        onHopsChange={setFragHops}
+      />
 
       {result.segments.length > 0 && (
         <div className="panel">

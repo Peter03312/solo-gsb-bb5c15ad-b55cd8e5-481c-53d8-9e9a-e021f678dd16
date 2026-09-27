@@ -17,6 +17,15 @@ import {
 } from '../src/lib/reverseDns'
 import { buildOption121, encodeRoute, resolveClientSegment } from '../src/lib/option121'
 import { buildDhcpPool, resolvePoolSegment } from '../src/lib/dhcpPool'
+import {
+  fragmentOffsetUnits,
+  fragmentTotalLength,
+  IPV4_HEADER_BYTES,
+  MAX_HOPS,
+  parseMtu,
+  parsePayloadBytes,
+  simulateFragmentation,
+} from '../src/lib/fragment'
 import { buildLeaseImport, mapHeader, parseCsv } from '../src/lib/leaseImport'
 import { checkMac, normalizeMacInput } from '../src/lib/mac'
 import { buildExportJson } from '../src/lib/exporter'
@@ -2637,6 +2646,175 @@ function simulateNoTransientDup(
   })())
   const fixedCsv = ['网段 CIDR,设备名,IPv4,MAC', '192.168.10.20/30,管理A,192.168.10.22,aa:bb:cc:00:00:01'].join('\n')
   check('改到新网段后恢复编排', buildMigrationPlan(importOrThrow(fixedCsv, existing, migratedPlan), existing, migratedPlan).steps.length === 1)
+}
+
+// ========== 24) IPv4 路径分片预演 ==========
+// 固定 20 字节首部、无选项；负载 1~65515；MTU 68~65535；1~8 跳
+{
+  // 24a) 录入校验：负载字节数
+  check('负载下限 1 通过', 'value' in parsePayloadBytes('1') && parsePayloadBytes('1').value === 1)
+  check('负载上限 65515 通过', 'value' in parsePayloadBytes('65515') && parsePayloadBytes('65515').value === 65515)
+  check('负载 0 拒绝', 'error' in parsePayloadBytes('0'))
+  check('负载 65516 拒绝（总长度超 65535）', 'error' in parsePayloadBytes('65516'))
+  check('负载非整数拒绝', 'error' in parsePayloadBytes('1.5') && 'error' in parsePayloadBytes('abc'))
+  check('负载空文本拒绝', 'error' in parsePayloadBytes('  '))
+  // 24b) 录入校验：MTU
+  check('MTU 下限 68 通过', 'value' in parseMtu('68') && parseMtu('68').value === 68)
+  check('MTU 1500 / 65535 通过', 'value' in parseMtu('1500') && 'value' in parseMtu('65535'))
+  check('MTU 67 拒绝', 'error' in parseMtu('67'))
+  check('MTU 65536 拒绝', 'error' in parseMtu('65536'))
+  check('MTU 非整数拒绝', 'error' in parseMtu('1500.5') && 'error' in parseMtu('mtu'))
+  check('跳数上限常量为 8', MAX_HOPS === 8)
+
+  // 24c) 经典拆分：负载 4000（总长度 4020）过 MTU 1500 -> 1480 + 1480 + 1040
+  const classic = simulateFragmentation(4000, false, [1500])
+  check(
+    'MTU 1500 拆为 3 片（1480/1480/1040）',
+    classic.hops.length === 1 &&
+      classic.hops[0].split &&
+      classic.finalFragments.map((f) => f.end - f.start).join(',') === '1480,1480,1040',
+    classic.finalFragments.map((f) => f.end - f.start).join(','),
+  )
+  check(
+    '偏移量 0/185/370（8 字节单位）',
+    classic.finalFragments.map(fragmentOffsetUnits).join(',') === '0,185,370',
+    classic.finalFragments.map(fragmentOffsetUnits).join(','),
+  )
+  check(
+    'MF 为 1,1,0（仅最后一片为 0）',
+    classic.finalFragments.map((f) => (f.mf ? 1 : 0)).join(',') === '1,1,0',
+  )
+  check(
+    '总长度 1500/1500/1060（含 20 字节首部）',
+    classic.finalFragments.map(fragmentTotalLength).join(',') === '1500,1500,1060',
+  )
+  check('首部开销 = 20 × 3 = 60', classic.headerBytes === 60 && classic.blockedHop === null)
+
+  // 24d) 总长度恰好等于 MTU：原样通过不拆分
+  const exact = simulateFragmentation(1480, false, [1500])
+  check(
+    '总长度 = MTU 时原样通过（1 片、未拆分）',
+    exact.finalFragments.length === 1 && !exact.hops[0].split && fragmentTotalLength(exact.finalFragments[0]) === 1500,
+  )
+  // 超 1 字节即拆分：1481 -> 1480 + 1（最后一片允许非 8 倍数）
+  const over1 = simulateFragmentation(1481, false, [1500])
+  check(
+    '超 1 字节拆为 1480 + 1（末片 1 字节合法）',
+    over1.finalFragments.map((f) => f.end - f.start).join(',') === '1480,1' &&
+      over1.finalFragments[1].mf === false,
+  )
+
+  // 24e) DF=1：首个阻断跳报告并停止，后续跳不评估
+  const dfBlocked = simulateFragmentation(4000, true, [5000, 1500, 9000])
+  check(
+    'DF=1 在第 2 跳阻断（首跳 5000 通过）',
+    dfBlocked.blockedHop === 2 &&
+      dfBlocked.hops.length === 2 &&
+      dfBlocked.hops[1].blocked &&
+      dfBlocked.hops[1].blockedTotalLength === 4020,
+    JSON.stringify({ blockedHop: dfBlocked.blockedHop, hops: dfBlocked.hops.length }),
+  )
+  check('DF=1 阻断前始终 1 片、开销 20', dfBlocked.finalFragments.length === 1 && dfBlocked.headerBytes === 20)
+  const dfPass = simulateFragmentation(4000, true, [5000, 9000])
+  check('DF=1 全部通过时不拆分', dfPass.blockedHop === null && dfPass.finalFragments.length === 1 && dfPass.hops.every((h) => !h.split))
+
+  // 24f) 后续跳再次分片：1500 -> 576（chunk = floor(556/8)*8 = 552）
+  const refrag = simulateFragmentation(4000, false, [1500, 576])
+  check(
+    '第二跳 MTU 576 再分片为 8 片',
+    refrag.finalFragments.length === 8 &&
+      refrag.finalFragments.map((f) => f.end - f.start).join(',') === '552,552,376,552,552,376,552,488',
+    refrag.finalFragments.map((f) => f.end - f.start).join(','),
+  )
+  check(
+    '再分片偏移量 0/69/138/185/254/323/370/439',
+    refrag.finalFragments.map(fragmentOffsetUnits).join(',') === '0,69,138,185,254,323,370,439',
+    refrag.finalFragments.map(fragmentOffsetUnits).join(','),
+  )
+  check(
+    '再分片 MF 仅末片为 0',
+    refrag.finalFragments.map((f) => (f.mf ? 1 : 0)).join(',') === '1,1,1,1,1,1,1,0',
+  )
+  check('再分片首部开销 = 20 × 8 = 160', refrag.headerBytes === 160)
+
+  // 24g) 不重组：先拆后遇大 MTU，片数不减少
+  const noReasm = simulateFragmentation(4000, false, [1500, 9000])
+  check(
+    '后续更大 MTU 不重组（仍 3 片、逐片通过）',
+    noReasm.finalFragments.length === 3 &&
+      !noReasm.hops[1].split &&
+      noReasm.finalFragments.map((f) => f.end - f.start).join(',') === '1480,1480,1040',
+  )
+
+  // 24h) 最小 MTU 68：chunk = 48；负载 100 -> 48 + 48 + 4
+  const tiny = simulateFragmentation(100, false, [68])
+  check(
+    'MTU 68 拆为 48/48/4（偏移 0/6/12）',
+    tiny.finalFragments.map((f) => f.end - f.start).join(',') === '48,48,4' &&
+      tiny.finalFragments.map(fragmentOffsetUnits).join(',') === '0,6,12',
+  )
+
+  // 24i) 非 8 倍数 MTU：取不超过 MTU 的最大 8 倍数负载（1499 -> 1472）
+  const oddMtu = simulateFragmentation(4000, false, [1499])
+  check(
+    'MTU 1499 按 1472 拆分（首片总长度 1492 ≤ 1499）',
+    oddMtu.finalFragments[0].end - oddMtu.finalFragments[0].start === 1472 &&
+      fragmentTotalLength(oddMtu.finalFragments[0]) === 1492,
+    String(oddMtu.finalFragments[0].end - oddMtu.finalFragments[0].start),
+  )
+
+  // 24j) 最大负载 65515：MTU 65535 原样通过；MTU 1500 拆 45 片（44×1480 + 395）
+  check(
+    '负载 65515 + MTU 65535 原样通过',
+    (() => {
+      const s = simulateFragmentation(65515, false, [65535])
+      return s.finalFragments.length === 1 && fragmentTotalLength(s.finalFragments[0]) === 65535
+    })(),
+  )
+  const maxFrag = simulateFragmentation(65515, false, [1500])
+  check(
+    '负载 65515 + MTU 1500 拆 45 片（末片 395）',
+    maxFrag.finalFragments.length === 45 &&
+      maxFrag.finalFragments[44].end - maxFrag.finalFragments[44].start === 395 &&
+      maxFrag.headerBytes === 900,
+  )
+
+  // 24k) 通用不变量：覆盖完整、偏移 8 倍数、非末片负载 8 倍数、MF 语义、片长不超各跳 MTU
+  const scenarios: Array<[number, boolean, number[]]> = [
+    [1, false, [68]],
+    [100, false, [1500, 68, 576]],
+    [1481, false, [1500, 68]],
+    [4000, false, [1500, 576, 68]],
+    [65515, false, [9000, 1500, 576]],
+    [2000, true, [68]], // DF=1 首跳即阻断
+    [5000, false, [65535, 68, 65535]], // 大-小-大：不重组
+  ]
+  for (const [p, df, mtus] of scenarios) {
+    const s = simulateFragmentation(p, df, mtus)
+    const frags = s.finalFragments
+    let ok = frags.length > 0 && frags[0].start === 0 && frags[frags.length - 1].end === p
+    for (let i = 1; i < frags.length; i++) ok = ok && frags[i].start === frags[i - 1].end
+    const minMtu = Math.min(...mtus.slice(0, s.hops.length))
+    for (const f of frags) {
+      ok = ok && f.start % 8 === 0 // 偏移量恒为整数（8 字节单位）
+      ok = ok && f.mf === f.end < p // MF 仅在该片之后仍有原始数据时为 1
+      if (f.end < p) ok = ok && (f.end - f.start) % 8 === 0 // 除原始最后一片外负载为 8 的倍数
+      if (s.blockedHop === null) ok = ok && fragmentTotalLength(f) <= minMtu // 未阻断时每片都能通过全部跳
+    }
+    ok = ok && s.headerBytes === IPV4_HEADER_BYTES * frags.length
+    if (df) ok = ok && frags.length === 1 // DF=1 永不拆分
+    check(`不变量场景 payload=${p} df=${df ? 1 : 0} mtus=${mtus.join('/')}`, ok, JSON.stringify(s.finalFragments))
+  }
+
+  // 24l) 阻断场景不评估后续跳：hops 只到阻断跳
+  const stopEarly = simulateFragmentation(60000, true, [65535, 1500, 68, 9000])
+  check(
+    'DF=1 阻断后后续跳不评估（仅评估到第 2 跳）',
+    stopEarly.hops.length === 2 && stopEarly.blockedHop === 2 && stopEarly.hops[1].mtu === 1500,
+  )
+  // DF=0 全路径评估
+  const fullPath = simulateFragmentation(60000, false, [65535, 1500, 68, 9000])
+  check('DF=0 评估全部 4 跳', fullPath.hops.length === 4 && fullPath.blockedHop === null)
 }
 
 console.log(failures === 0 ? '\n全部测试通过 ✅' : `\n${failures} 个测试失败 ❌`)

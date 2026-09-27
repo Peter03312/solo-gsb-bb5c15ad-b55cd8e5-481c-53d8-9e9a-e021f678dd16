@@ -268,3 +268,13 @@ export interface Option121RouteInput {
   /** 下一跳 IPv4 文本，必须是客户端网段内的可用主机地址 */
   gateway: string
 }
+
+/* ---------- IPv4 路径分片预演 ---------- */
+
+/** 一跳 MTU 录入（仅随当前会话中的输入存在，不参与规划/基线/汇总/导出） */
+export interface FragHopInput {
+  /** 行内稳定 ID，规划或登记变化后按它原样保留录入并重新校验 */
+  id: string
+  /** MTU 文本（68～65535 的整数；空白行为占位行，不参与预演） */
+  mtu: string
+}
